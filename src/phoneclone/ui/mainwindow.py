@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QButtonGroup,
@@ -26,7 +27,7 @@ from PySide6.QtWidgets import (
     QWidget,
     QApplication,
 )
-from phoneclone.adb import AdbClient
+from phoneclone.adb import AdbClient, find_adb
 from phoneclone.apps import AppManager
 from phoneclone.config import EmulatorConfig
 from phoneclone.display import DisplayPanel
@@ -34,6 +35,20 @@ from phoneclone.qemu import QemuEmulator
 from phoneclone.runtime import RuntimeManager
 from phoneclone.ui.styles import BLUESTACKS_STYLE
 from phoneclone.ui.welcome import WelcomeOverlay
+
+
+class _AdbBootstrapWorker(QThread):
+    finished_ok = Signal()
+    failed = Signal(str)
+
+    def run(self) -> None:
+        try:
+            from phoneclone.downloads import download_platform_tools
+
+            download_platform_tools()
+            self.finished_ok.emit()
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(str(exc))
 
 
 class SettingsDialog(QDialog):
@@ -107,9 +122,12 @@ class BlueStacksWindow(QMainWindow):
         self._adb_timer = QTimer(self)
         self._adb_timer.setSingleShot(True)
         self._adb_timer.timeout.connect(self._on_adb_ready)
-        self._boot_display_timer = QTimer(self)
-        self._boot_display_timer.setSingleShot(True)
-        self._boot_display_timer.timeout.connect(self._connect_display)
+        self._vnc_retry_timer = QTimer(self)
+        self._vnc_retry_timer.timeout.connect(self._connect_display)
+        self._vnc_connected = False
+        self._qemu_error_shown = False
+        self._qemu_recent_errors: list[str] = []
+        self._adb_worker: _AdbBootstrapWorker | None = None
 
         self._build_ui()
 
@@ -117,8 +135,11 @@ class BlueStacksWindow(QMainWindow):
         self.welcome.setGeometry(self.rect())
         self._wire_runtime()
 
+        self.display.status_changed.connect(self._on_display_status)
+
         if RuntimeManager.is_ready():
             self.welcome.hide()
+            self._ensure_adb_tools()
             if self.config.auto_start:
                 QTimer.singleShot(400, self._start_android)
         else:
@@ -312,35 +333,196 @@ class BlueStacksWindow(QMainWindow):
         self.config.save()
         self.emulator.config = self.config
         self.welcome.hide_overlay()
+        self._refresh_adb_client()
         self._start_android()
 
     def _on_runtime_failed(self, message: str) -> None:
         self.welcome.start_btn.setEnabled(True)
         QMessageBox.critical(self, "Setup failed", message)
 
+    def _refresh_adb_client(self) -> None:
+        self.adb = AdbClient(self.config.adb_port)
+        self.apps = AppManager(self.adb)
+
+    def _ensure_adb_tools(self) -> None:
+        if find_adb():
+            self._refresh_adb_client()
+            return
+        if self._adb_worker and self._adb_worker.isRunning():
+            return
+        self._set_status("Downloading ADB tools…", "#58a6ff")
+        self._adb_worker = _AdbBootstrapWorker()
+        self._adb_worker.finished_ok.connect(self._on_adb_tools_ready)
+        self._adb_worker.failed.connect(self._on_adb_tools_failed)
+        self._adb_worker.start()
+
+    def _on_adb_tools_ready(self) -> None:
+        self._refresh_adb_client()
+        self._set_status("Ready", "#3fb950")
+
+    def _on_adb_tools_failed(self, message: str) -> None:
+        self._set_status("ADB tools missing", "#d29922")
+        QMessageBox.warning(
+            self,
+            "ADB tools",
+            f"Could not download ADB tools:\n{message}\n\n"
+            "Install Android platform-tools or retry setup.",
+        )
+
+    def _prepare_android_launch(self) -> str | None:
+        """Free stale QEMU ports and disable broken WHPX. Returns a user-facing warning."""
+        from phoneclone.port_util import release_qemu_ports
+
+        # #region agent log
+        from phoneclone._agent_debug import agent_log
+
+        stopped = release_qemu_ports(self.config.adb_port, self.config.vnc_port)
+        agent_log(
+            "mainwindow.py:_prepare_android_launch",
+            "port cleanup",
+            data={"stopped_pids": stopped, "adb_port": self.config.adb_port, "vnc_port": self.config.vnc_port},
+            hypothesis_id="H8",
+            run_id="post-fix",
+        )
+        # #endregion
+
+        warning = ""
+        if self.config.use_whp and not QemuEmulator.whpx_available():
+            self.config.use_whp = False
+            self.config.save()
+            self.emulator.config = self.config
+            warning = (
+                "Hardware acceleration (WHPX) is unavailable on this PC "
+                "(Windows may report “not enough space on device” — that refers to the hypervisor, not your disk). "
+                "PhoneClone will run using software emulation, which is slower but should work."
+            )
+        return warning or None
+
+    @staticmethod
+    def _friendly_qemu_line(line: str) -> str:
+        lower = line.lower()
+        if "no space left on device" in lower and "whpx" in lower:
+            return (
+                "WHPX (Windows hypervisor) failed — the “not enough space on device” message is misleading; "
+                "it is not your hard drive. Disable WHPX in Settings or let PhoneClone turn it off automatically."
+            )
+        if "could not set up host forwarding" in lower or "hostfwd" in lower:
+            return (
+                "ADB port is already in use (often a leftover qemu-system-x86_64.exe). "
+                "Use Restart Android again after PhoneClone clears the old process."
+            )
+        if "failed to find an available port" in lower and "vnc" in lower:
+            return "VNC display port is already in use. Close other emulators or restart PhoneClone."
+        return line.strip()
+
+    def _qemu_exit_message(self) -> str:
+        hints = [self._friendly_qemu_line(line) for line in self._qemu_recent_errors[-6:]]
+        unique: list[str] = []
+        for hint in hints:
+            if hint and hint not in unique:
+                unique.append(hint)
+        body = "\n\n".join(unique) if unique else (
+            "The Android emulator exited unexpectedly.\n\n"
+            "Try Settings → disable WHPX, then Restart Android."
+        )
+        return body
+
+    def _on_display_status(self, message: str) -> None:
+        lower = message.lower()
+        if "connected" in lower and "connecting" not in lower:
+            self._vnc_connected = True
+            self._vnc_retry_timer.stop()
+            self._set_status("Android running", "#3fb950")
+        elif "error" in lower or "disconnected" in lower:
+            self._vnc_connected = False
+            self._set_status(message, "#d29922")
+        elif message:
+            self._set_status(message, "#58a6ff")
+
     def _start_android(self) -> None:
+        # #region agent log
+        from phoneclone._agent_debug import agent_log
+
+        agent_log(
+            "mainwindow.py:_start_android",
+            "enter",
+            data={"already_running": self.emulator.is_running},
+            hypothesis_id="H3",
+        )
+        # #endregion
         if self.emulator.is_running:
             return
         self.config.apply_bundled_defaults()
         self.emulator.config = self.config
+        whpx_warning = self._prepare_android_launch()
         errors = self.config.validate()
         if errors:
             self.welcome.show()
             self._set_status("Setup required", "#d29922")
+            QMessageBox.warning(
+                self,
+                "Setup required",
+                "PhoneClone is not ready to start Android yet:\n\n" + "\n".join(f"• {e}" for e in errors),
+            )
             return
+        if whpx_warning:
+            self._set_status("WHPX disabled — starting with software emulation", "#d29922")
+        self._qemu_recent_errors.clear()
         try:
             self.emulator.start()
         except (OSError, ValueError, RuntimeError) as exc:
+            # #region agent log
+            agent_log(
+                "mainwindow.py:_start_android",
+                "start failed",
+                data={"error": str(exc)},
+                hypothesis_id="H3",
+            )
+            # #endregion
             QMessageBox.critical(self, "Could not start Android", str(exc))
             return
-        self._set_status("Starting Android…", "#58a6ff")
+        # #region agent log
+        agent_log(
+            "mainwindow.py:_start_android",
+            "qemu started",
+            data={
+                "qemu_path": self.config.qemu_path,
+                "system_image": self.config.system_image,
+                "vnc_port": self.config.vnc_port,
+                "use_whp": self.config.use_whp,
+                "gpu_mode": self.config.gpu_mode,
+            },
+            hypothesis_id="H3",
+        )
+        # #endregion
+        self._vnc_connected = False
+        self._qemu_error_shown = False
+        if whpx_warning:
+            QMessageBox.information(self, "Hardware acceleration", whpx_warning)
+        self._set_status("Starting Android… (first boot may take 1–2 min)", "#58a6ff")
         self._output_timer.start(300)
-        self._boot_display_timer.start(5000)
-        self._adb_timer.start(20000)
+        self._vnc_retry_timer.start(4000)
+        QTimer.singleShot(8000, self._connect_display)
+        self._adb_timer.start(25000)
 
     def _connect_display(self) -> None:
+        # #region agent log
+        from phoneclone._agent_debug import agent_log
+
+        agent_log(
+            "mainwindow.py:_connect_display",
+            "attempt",
+            data={
+                "qemu_running": self.emulator.is_running,
+                "vnc_connected": self._vnc_connected,
+                "vnc_port": self.config.vnc_port,
+            },
+            hypothesis_id="H2",
+        )
+        # #endregion
+        if not self.emulator.is_running or self._vnc_connected:
+            return
         self.display.start(self.config.vnc_port)
-        self._set_status("Android running", "#3fb950")
 
     def _restart_android(self) -> None:
         self._stop_android()
@@ -349,16 +531,75 @@ class BlueStacksWindow(QMainWindow):
     def _stop_android(self) -> None:
         self._output_timer.stop()
         self._adb_timer.stop()
-        self._boot_display_timer.stop()
+        self._vnc_retry_timer.stop()
+        self._vnc_connected = False
         self.display.stop()
         self.emulator.stop()
+        from phoneclone.port_util import release_qemu_ports
+
+        release_qemu_ports(self.config.adb_port, self.config.vnc_port)
         self._set_status("Offline", "#8b949e")
 
     def _poll_qemu(self) -> None:
+        # #region agent log
+        import time as _time
+
+        from phoneclone._agent_debug import agent_log
+
+        _poll_t0 = _time.perf_counter()
+        _lines = 0
+        # #endregion
+        while True:
+            line = self.emulator.read_output_line()
+            if not line:
+                break
+            # #region agent log
+            _lines += 1
+            # #endregion
+            lower = line.lower()
+            if any(token in lower for token in ("error", "failed", "could not", "not supported", "space left")):
+                self._qemu_recent_errors.append(line.strip())
+                self._set_status(self._friendly_qemu_line(line)[:160], "#d29922")
+                # #region agent log
+                agent_log(
+                    "mainwindow.py:_poll_qemu",
+                    "qemu error line",
+                    data={"line": line.strip()[:200]},
+                    hypothesis_id="H6",
+                    run_id="post-fix",
+                )
+                # #endregion
+        # #region agent log
+        _poll_ms = int((_time.perf_counter() - _poll_t0) * 1000)
+        if _poll_ms >= 100 or _lines or not self.emulator.is_running:
+            agent_log(
+                "mainwindow.py:_poll_qemu",
+                "poll done",
+                data={
+                    "poll_ms": _poll_ms,
+                    "lines_read": _lines,
+                    "qemu_running": self.emulator.is_running,
+                },
+                hypothesis_id="H1",
+            )
+        # #endregion
         if not self.emulator.is_running:
             self._output_timer.stop()
+            self._vnc_retry_timer.stop()
             self.display.stop()
             self._set_status("Android stopped", "#d29922")
+            if not self._qemu_error_shown:
+                self._qemu_error_shown = True
+                # #region agent log
+                agent_log(
+                    "mainwindow.py:_poll_qemu",
+                    "qemu exited",
+                    data={"errors": self._qemu_recent_errors[-6:]},
+                    hypothesis_id="H3",
+                    run_id="post-fix",
+                )
+                # #endregion
+                QMessageBox.warning(self, "Android stopped", self._qemu_exit_message())
 
     def _on_adb_ready(self) -> None:
         if self.emulator.is_running:
@@ -376,16 +617,49 @@ class BlueStacksWindow(QMainWindow):
 
     def _install_paths(self, paths: list) -> None:
         if not self.emulator.is_running:
-            QMessageBox.information(self, "Android not running", "Wait for Android to finish starting.")
+            QMessageBox.information(
+                self,
+                "Android not running",
+                "Start Android first (Home screen) and wait until the status shows "
+                "“Android running”, then try again.",
+            )
             return
-        self.adb.connect()
+        if not self.adb.available:
+            self._ensure_adb_tools()
+            QMessageBox.warning(
+                self,
+                "ADB not ready",
+                "PhoneClone is still downloading ADB tools, or they are missing.\n\n"
+                "Wait a moment and try again, or run Get Started setup.",
+            )
+            return
+        self._set_status("Connecting to Android for install…", "#58a6ff")
+        if not self.adb.wait_for_device(timeout_sec=60):
+            QMessageBox.warning(
+                self,
+                "Android not ready",
+                "Could not reach Android over ADB yet.\n\n"
+                "Wait until the Home screen appears (up to 1–2 minutes on first boot). "
+                "If the screen stays blank, restart Android from the Home toolbar.",
+            )
+            self._set_status("ADB not ready", "#d29922")
+            return
         ok = 0
+        errors: list[str] = []
         for path in paths:
-            if self.adb.install_apk(path):
+            success, message = self.adb.install_apk(path)
+            if success:
                 ok += 1
+            else:
+                name = Path(path).name
+                errors.append(f"{name}: {message}")
         if ok:
             QMessageBox.information(self, "Installed", f"Installed {ok} app(s). Open them from My Apps.")
             self._refresh_apps()
+            self._set_status("Android running", "#3fb950")
+        elif errors:
+            QMessageBox.warning(self, "Install failed", "\n\n".join(errors))
+            self._set_status("Install failed", "#d29922")
 
     def _refresh_apps(self) -> None:
         self.app_list.clear()
