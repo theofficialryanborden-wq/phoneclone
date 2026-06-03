@@ -6,7 +6,7 @@ import threading
 from typing import Callable
 
 from PIL import Image
-from PySide6.QtCore import QObject, QTimer, Signal
+from PySide6.QtCore import QObject, Signal
 from PySide6.QtGui import QImage, QPixmap
 
 
@@ -26,10 +26,10 @@ class VncClient(QObject):
         self._stop = threading.Event()
         self._width = 0
         self._height = 0
+        self._frame: Image.Image | None = None
 
     def start(self) -> None:
-        if self._thread and self._thread.is_alive():
-            return
+        self.stop()
         self._stop.clear()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
@@ -45,6 +45,7 @@ class VncClient(QObject):
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=2)
         self._thread = None
+        self._frame = None
 
     def send_pointer(self, x: int, y: int, button_mask: int = 0) -> None:
         if not self._sock:
@@ -74,17 +75,52 @@ class VncClient(QObject):
             remaining -= len(chunk)
         return b"".join(chunks)
 
+    def _emit_frame(self) -> None:
+        if not self._frame:
+            return
+        w, h = self._frame.size
+        qimage = QImage(self._frame.tobytes("raw", "RGBA"), w, h, QImage.Format.Format_RGBA8888)
+        self.frame_ready.emit(QPixmap.fromImage(qimage.copy()))
+
     def _run(self) -> None:
         try:
-            self.status_changed.emit(f"Connecting to VNC {self.host}:{self.port}...")
+            # #region agent log
+            from phoneclone._agent_debug import agent_log
+
+            agent_log(
+                "vnc.py:_run",
+                "connecting",
+                data={"host": self.host, "port": self.port},
+                hypothesis_id="H2",
+            )
+            # #endregion
+            self.status_changed.emit(f"Connecting to VNC {self.host}:{self.port}…")
             self._sock = socket.create_connection((self.host, self.port), timeout=10)
             self._sock.settimeout(0.5)
             self._handshake()
+            # #region agent log
+            agent_log(
+                "vnc.py:_run",
+                "handshake ok",
+                data={"width": self._width, "height": self._height},
+                hypothesis_id="H2",
+            )
+            # #endregion
             self.status_changed.emit("VNC connected.")
             while not self._stop.is_set():
                 self._request_frame()
                 self._read_server_messages()
         except Exception as exc:  # noqa: BLE001 - surface to UI
+            # #region agent log
+            from phoneclone._agent_debug import agent_log
+
+            agent_log(
+                "vnc.py:_run",
+                "vnc failed",
+                data={"error": str(exc), "stopped": self._stop.is_set()},
+                hypothesis_id="H2",
+            )
+            # #endregion
             if not self._stop.is_set():
                 self.status_changed.emit(f"VNC error: {exc}")
                 self.connection_lost.emit()
@@ -118,17 +154,15 @@ class VncClient(QObject):
 
         self._sock.sendall(b"\x01")  # shared desktop
         self._width, self._height = struct.unpack("!HH", self._recv_exact(4))
-        _bpp, _depth, _big, _true, _rmax, _gmax, _bmax, _rshift, _gshift, _bshift = struct.unpack(
-            "!BBBBHHHBBBxxx", self._recv_exact(16)
-        )
+        self._recv_exact(16)  # pixel format
         name_len = struct.unpack("!I", self._recv_exact(4))[0]
         self._recv_exact(name_len)
+
+        self._frame = Image.new("RGBA", (self._width, self._height))
 
         self._sock.sendall(b"\x01")  # SetEncodings
         self._sock.sendall(struct.pack("!H", 1))
         self._sock.sendall(struct.pack("!i", 0))  # Raw encoding
-
-        self._sock.sendall(b"\x00")  # SetPixelFormat (optional, skip for raw)
 
     def _request_frame(self) -> None:
         assert self._sock is not None
@@ -146,19 +180,19 @@ class VncClient(QObject):
         if msg_type == 0:  # FramebufferUpdate
             self._recv_exact(1)
             count = struct.unpack("!H", self._recv_exact(2))[0]
+            updated = False
             for _ in range(count):
                 x, y, w, h = struct.unpack("!HHHH", self._recv_exact(8))
                 encoding = struct.unpack("!i", self._recv_exact(4))[0]
                 if encoding != 0:
-                    continue
+                    raise ConnectionError(f"Unsupported VNC encoding {encoding}.")
                 pixel_bytes = self._recv_exact(w * h * 4)
-                image = Image.frombytes("RGBA", (w, h), pixel_bytes, "raw", "BGRA")
-                if w == self._width and h == self._height:
-                    qimage = QImage(image.tobytes("raw", "RGBA"), w, h, QImage.Format.Format_RGBA8888)
-                    self.frame_ready.emit(QPixmap.fromImage(qimage.copy()))
-                else:
-                    # Partial update not implemented; request full frame next loop
-                    pass
+                tile = Image.frombytes("RGBA", (w, h), pixel_bytes, "raw", "BGRA")
+                if self._frame:
+                    self._frame.paste(tile, (x, y))
+                    updated = True
+            if updated:
+                self._emit_frame()
         elif msg_type == 1:
             self._recv_exact(19)
         elif msg_type == 2:

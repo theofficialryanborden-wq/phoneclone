@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import queue
 import subprocess
 import sys
+import threading
 from pathlib import Path
 from typing import Callable
 
@@ -31,6 +33,8 @@ class QemuEmulator:
         self.config = config
         self._log = log or (lambda _msg: None)
         self._process: subprocess.Popen[str] | None = None
+        self._output_queue: queue.Queue[str] = queue.Queue()
+        self._reader_thread: threading.Thread | None = None
 
     @property
     def is_running(self) -> bool:
@@ -135,6 +139,7 @@ class QemuEmulator:
             self._log("GPU: QXL display adapter.")
 
         creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+        self._output_queue = queue.Queue()
         self._process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -142,11 +147,51 @@ class QemuEmulator:
             text=True,
             creationflags=creationflags,
         )
+        self._reader_thread = threading.Thread(target=self._stdout_reader, daemon=True)
+        self._reader_thread.start()
+
+    def _stdout_reader(self) -> None:
+        proc = self._process
+        if not proc or not proc.stdout:
+            return
+        while proc.poll() is None:
+            line = proc.stdout.readline()
+            if line:
+                self._output_queue.put(line)
+        if proc.stdout:
+            for line in proc.stdout:
+                if line:
+                    self._output_queue.put(line)
 
     def read_output_line(self) -> str | None:
-        if not self._process or not self._process.stdout:
-            return None
-        return self._process.stdout.readline()
+        # #region agent log
+        import time as _time
+
+        from phoneclone._agent_debug import agent_log
+
+        _t0 = _time.perf_counter()
+        # #endregion
+        try:
+            line = self._output_queue.get_nowait()
+        except queue.Empty:
+            line = None
+        # #region agent log
+        _elapsed_ms = int((_time.perf_counter() - _t0) * 1000)
+        if _elapsed_ms >= 50 or line:
+            agent_log(
+                "qemu.py:read_output_line",
+                "dequeued line",
+                data={
+                    "elapsed_ms": _elapsed_ms,
+                    "got_line": bool(line),
+                    "line_len": len(line) if line else 0,
+                    "poll_null": self._process.poll() if self._process else None,
+                },
+                hypothesis_id="H1",
+                run_id="post-fix",
+            )
+        # #endregion
+        return line
 
     def stop(self) -> None:
         if not self._process:
@@ -158,6 +203,9 @@ class QemuEmulator:
             except subprocess.TimeoutExpired:
                 self._process.kill()
                 self._process.wait(timeout=3)
+        if self._reader_thread and self._reader_thread.is_alive():
+            self._reader_thread.join(timeout=2)
+        self._reader_thread = None
         self._process = None
         self._log("Emulator stopped.")
 
@@ -210,4 +258,8 @@ class QemuEmulator:
             creationflags=flags,
         )
         combined = (result.stdout + result.stderr).lower()
-        return "whpx" in combined and "not supported" not in combined and "failed" not in combined
+        if "not supported" in combined or "failed" in combined:
+            return False
+        if "no space left on device" in combined:
+            return False
+        return "whpx" in combined

@@ -24,7 +24,9 @@ class EmulatorConfig:
     cpu_mode: str = "auto"  # auto | host | max | qemu64
     video_memory_mb: int = 128
     enable_cpu_pm: bool = True
-    # Setup wizard
+    auto_start: bool = True
+    runtime_ready: bool = False
+    # Legacy flag kept for upgrades
     setup_complete: bool = False
     # Location
     location_address: str = ""
@@ -56,9 +58,11 @@ class EmulatorConfig:
         return cls(**{k: v for k, v in data.items() if k in cls.__dataclass_fields__})
 
     def needs_setup(self) -> bool:
-        if not self.setup_complete:
-            return True
-        return bool(self.validate())
+        from phoneclone.downloads import runtime_ready
+
+        if self.runtime_ready or self.setup_complete:
+            return not runtime_ready() and bool(self.validate())
+        return True
 
     def apply_bundled_defaults(self) -> None:
         from phoneclone.paths import PhoneClonePaths

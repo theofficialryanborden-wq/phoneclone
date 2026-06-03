@@ -21,7 +21,7 @@ class DisplayPanel(QWidget):
         self._vnc.status_changed.connect(self.status_changed.emit)
         self._vnc.connection_lost.connect(lambda: self.status_changed.emit("VNC disconnected."))
 
-        self._label = QLabel("Power on the emulator to see Android here.")
+        self._label = QLabel("Android will appear here when ready.")
         self._label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self._label.setMinimumSize(320, 568)
