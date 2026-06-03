@@ -4,11 +4,11 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QDragEnterEvent, QDropEvent, QMouseEvent, QPixmap, QWheelEvent
 from PySide6.QtWidgets import QLabel, QSizePolicy, QVBoxLayout, QWidget
 
-from phoneclone.vnc import VncClient
+from phoneclone.qmp_display import QmpDisplayClient
 
 
 class DisplayPanel(QWidget):
-    """Touch/mouse forwarding display backed by a VNC stream."""
+    """Touch/mouse display via QEMU QMP screendump + input-send-event."""
 
     status_changed = Signal(str)
     files_dropped = Signal(list)
@@ -16,10 +16,12 @@ class DisplayPanel(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setAcceptDrops(True)
-        self._vnc = VncClient()
-        self._vnc.frame_ready.connect(self._on_frame)
-        self._vnc.status_changed.connect(self.status_changed.emit)
-        self._vnc.connection_lost.connect(lambda: self.status_changed.emit("VNC disconnected."))
+        self._capture = QmpDisplayClient()
+        self._capture.frame_ready.connect(self._on_frame)
+        self._capture.status_changed.connect(self.status_changed.emit)
+        self._capture.connection_lost.connect(
+            lambda: self.status_changed.emit("Display disconnected.")
+        )
 
         self._label = QLabel("Android will appear here when ready.")
         self._label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -41,11 +43,11 @@ class DisplayPanel(QWidget):
 
     def start(self, port: int) -> None:
         self.stop()
-        self._vnc.port = port
-        self._vnc.start()
+        self._capture.port = port
+        self._capture.start()
 
     def stop(self) -> None:
-        self._vnc.stop()
+        self._capture.stop()
         self._label.setText("Emulator stopped.")
         self._label.setPixmap(QPixmap())
 
@@ -84,14 +86,14 @@ class DisplayPanel(QWidget):
                 if event.button() == Qt.MouseButton.LeftButton:
                     self._button_mask = 1
                 x, y = self._map_coords(event.position().toPoint())
-                self._vnc.send_pointer(x, y, self._button_mask)
+                self._capture.send_pointer(x, y, self._button_mask)
             elif event.type() == event.Type.MouseButtonRelease:
                 x, y = self._map_coords(event.position().toPoint())
                 self._button_mask = 0
-                self._vnc.send_pointer(x, y, 0)
+                self._capture.send_pointer(x, y, 0)
             elif event.type() == event.Type.MouseMove and self._button_mask:
                 x, y = self._map_coords(event.position().toPoint())
-                self._vnc.send_pointer(x, y, self._button_mask)
+                self._capture.send_pointer(x, y, self._button_mask)
         elif isinstance(event, QWheelEvent):
             # Scroll as mouse wheel buttons 4/5 via key events is unreliable; ignore for now.
             pass

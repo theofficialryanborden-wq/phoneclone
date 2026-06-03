@@ -167,7 +167,7 @@ class VncClient(QObject):
     def _request_frame(self) -> None:
         assert self._sock is not None
         self._sock.sendall(
-            struct.pack("!BBHHHH", 3, 0, 0, 0, self._width, self._height)
+            struct.pack("!BBHHHH", 2, 0, 0, 0, self._width, self._height)
         )
 
     def _read_server_messages(self) -> None:
