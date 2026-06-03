@@ -4,25 +4,35 @@ import re
 import shutil
 import subprocess
 import sys
+import tarfile
 import urllib.error
 import urllib.request
 import zipfile
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Literal
 
 from phoneclone.paths import PhoneClonePaths
 
 ProgressCallback = Callable[[int, str], None]
 
-# Pinned fallback when directory listing scrape fails.
-QEMU_ZIP_FALLBACK = "https://qemu.weilnetz.de/w64/2024/qemu-w64-20241218.zip"
 QEMU_LISTING_URL = "https://qemu.weilnetz.de/w64/"
+QEMU_SETUP_FALLBACK = "https://qemu.weilnetz.de/w64/qemu-w64-setup-20260501.exe"
+QEMU_ZIP_FALLBACK = (
+    "https://github.com/ganarcasas/qemu-portable/releases/download/20241220/qemu-portable-20241220.zip"
+)
+QEMU_SETUP_RE = re.compile(r"qemu-w64-setup-(\d{8})\.exe", re.I)
+QEMU_ZIP_RE = re.compile(r"qemu-w64-(\d{8})\.zip", re.I)
 
-ANDROID_ISO_URLS = (
-    "https://zenlayer.dl.sourceforge.net/project/android-x86/Release%209.0/android-x86_64-9.0-r2.iso?viasf=1",
-    "https://netactuate.dl.sourceforge.net/project/android-x86/Release%209.0/android-x86_64-9.0-r2.iso?viasf=1",
-    "https://sourceforge.net/projects/android-x86/files/Release%209.0/android-x86_64-9.0-r2.iso/download",
+PLATFORM_TOOLS_URL = (
+    "https://dl.google.com/android/repository/platform-tools-latest-windows.zip"
+)
+
+# Pre-installed Android-x86 VirtualBox images (no ISO install required).
+ANDROID_RUNTIME_URLS = (
+    "https://zenlayer.dl.sourceforge.net/project/linuxvmimages/files/VirtualBox/A/Android_x86_64BIT_9.0_r2_VB.zip?viasf=1",
+    "https://netactuate.dl.sourceforge.net/project/linuxvmimages/files/VirtualBox/A/Android_x86_64BIT_9.0_r2_VB.zip?viasf=1",
+    "https://sourceforge.net/projects/linuxvmimages/files/VirtualBox/A/Android_x86_64BIT_9.0_r2_VB.zip/download",
 )
 
 
@@ -61,27 +71,38 @@ class _DownloadReporter:
         _emit(self._progress, pct, f"{self._label}: {mb:.1f} / {total_mb:.1f} MB")
 
 
-def find_latest_qemu_zip_url() -> str:
+def find_latest_qemu_download() -> tuple[str, Literal["exe", "zip"]]:
     try:
         with urllib.request.urlopen(QEMU_LISTING_URL, timeout=30) as response:
             html = response.read().decode("utf-8", errors="replace")
     except (urllib.error.URLError, TimeoutError):
-        return QEMU_ZIP_FALLBACK
+        return QEMU_SETUP_FALLBACK, "exe"
 
     parser = _LinkParser()
     parser.feed(html)
-    zips = [link for link in parser.links if re.search(r"qemu-w64-\d{8}\.zip", link, re.I)]
-    if not zips:
-        return QEMU_ZIP_FALLBACK
+    setups = [link for link in parser.links if QEMU_SETUP_RE.search(link)]
+    zips = [link for link in parser.links if QEMU_ZIP_RE.search(link)]
 
-    def sort_key(url: str) -> str:
-        match = re.search(r"qemu-w64-(\d{8})\.zip", url, re.I)
-        return match.group(1) if match else ""
+    def _pick_newest(links: list[str], pattern: re.Pattern[str]) -> str:
+        dated: list[tuple[str, str]] = []
+        for link in links:
+            match = pattern.search(link)
+            if match:
+                dated.append((match.group(1), link))
+        if not dated:
+            return links[-1]
+        dated.sort(key=lambda item: item[0])
+        return dated[-1][1]
 
-    best = sorted(zips, key=sort_key)[-1]
-    if best.startswith("http"):
-        return best
-    return urllib.request.urljoin(QEMU_LISTING_URL, best)
+    if setups:
+        best = _pick_newest(setups, QEMU_SETUP_RE)
+        url = best if best.startswith("http") else urllib.request.urljoin(QEMU_LISTING_URL, best)
+        return url, "exe"
+    if zips:
+        best = _pick_newest(zips, QEMU_ZIP_RE)
+        url = best if best.startswith("http") else urllib.request.urljoin(QEMU_LISTING_URL, best)
+        return url, "zip"
+    return QEMU_SETUP_FALLBACK, "exe"
 
 
 def download_file(
@@ -105,99 +126,170 @@ def download_file(
     return dest
 
 
+def _install_qemu_from_setup(installer: Path, dest: Path) -> None:
+    if dest.exists():
+        shutil.rmtree(dest, ignore_errors=True)
+    dest.mkdir(parents=True, exist_ok=True)
+    flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+    result = subprocess.run(
+        [str(installer), "/S", f"/D={dest.resolve()}"],
+        creationflags=flags,
+        timeout=900,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"QEMU installer exited with code {result.returncode}.")
+
+
+def _extract_qemu_zip(zip_path: Path, dest: Path) -> None:
+    if dest.exists():
+        shutil.rmtree(dest, ignore_errors=True)
+    dest.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(zip_path, "r") as archive:
+        archive.extractall(dest)
+
+
+def download_platform_tools(progress: ProgressCallback | None = None) -> Path:
+    """Download Google platform-tools (adb) into ~/.phoneclone/platform-tools."""
+    paths = PhoneClonePaths()
+    paths.ensure()
+    if paths.adb_exe.is_file():
+        return paths.adb_exe
+
+    zip_path = paths.cache_dir / "platform-tools.zip"
+    _emit(progress, 0, "Downloading ADB tools…")
+    download_file(PLATFORM_TOOLS_URL, zip_path, progress=progress, label="ADB")
+    _emit(progress, 95, "Installing ADB tools…")
+    with zipfile.ZipFile(zip_path, "r") as archive:
+        archive.extractall(paths.root)
+    if not paths.adb_exe.is_file():
+        raise RuntimeError("platform-tools archive did not contain adb.exe.")
+    _emit(progress, 100, "ADB tools ready.")
+    return paths.adb_exe
+
+
 def download_qemu(progress: ProgressCallback | None = None) -> Path:
     paths = PhoneClonePaths()
     paths.ensure()
-    url = find_latest_qemu_zip_url()
-    zip_path = paths.cache_dir / "qemu-portable.zip"
-    _emit(progress, 0, "Fetching QEMU package list…")
-    download_file(url, zip_path, progress=progress, label="QEMU")
-    _emit(progress, 95, "Extracting QEMU…")
-    if paths.qemu_dir.exists():
-        shutil.rmtree(paths.qemu_dir, ignore_errors=True)
-    paths.qemu_dir.mkdir(parents=True, exist_ok=True)
-    with zipfile.ZipFile(zip_path, "r") as archive:
-        archive.extractall(paths.qemu_dir)
-    exe = paths.qemu_exe
-    if not exe.is_file():
-        raise RuntimeError("QEMU archive extracted but qemu-system-x86_64.exe was not found.")
-    _emit(progress, 100, f"QEMU ready at {exe}")
-    return exe
+    url, kind = find_latest_qemu_download()
+    _emit(progress, 0, "Fetching emulator engine…")
+    errors: list[str] = []
 
-
-def download_android_iso(progress: ProgressCallback | None = None) -> Path:
-    paths = PhoneClonePaths()
-    paths.ensure()
-    dest = paths.android_iso
-    last_error = ""
-    for url in ANDROID_ISO_URLS:
+    if kind == "exe":
+        installer_path = paths.cache_dir / "qemu-installer.exe"
         try:
-            return download_file(url, dest, progress=progress, label="Android-x86 ISO")
-        except RuntimeError as exc:
-            last_error = str(exc)
-            if dest.exists():
-                dest.unlink(missing_ok=True)
-    raise RuntimeError(last_error or "Could not download Android-x86 ISO.")
+            download_file(url, installer_path, progress=progress, label="Engine")
+            _emit(progress, 95, "Installing engine…")
+            _install_qemu_from_setup(installer_path, paths.qemu_dir)
+            exe = paths.qemu_exe
+            if exe.is_file():
+                _emit(progress, 100, "Engine ready.")
+                return exe
+            errors.append("Engine install finished but qemu-system-x86_64.exe was not found.")
+        except (RuntimeError, OSError, subprocess.TimeoutExpired) as exc:
+            errors.append(str(exc))
+
+    zip_url = url if kind == "zip" else QEMU_ZIP_FALLBACK
+    zip_path = paths.cache_dir / "qemu-portable.zip"
+    try:
+        if kind != "zip":
+            _emit(progress, 5, "Retrying with portable engine…")
+        download_file(zip_url, zip_path, progress=progress, label="Engine")
+        _emit(progress, 95, "Extracting engine…")
+        _extract_qemu_zip(zip_path, paths.qemu_dir)
+        exe = paths.qemu_exe
+        if not exe.is_file():
+            raise RuntimeError("Engine archive extracted but qemu-system-x86_64.exe was not found.")
+        _emit(progress, 100, "Engine ready.")
+        return exe
+    except RuntimeError as exc:
+        errors.append(str(exc))
+
+    raise RuntimeError(errors[-1] if errors else "Could not download the emulator engine.")
 
 
-def create_android_disk(
-    qemu_img: Path | str,
-    dest: Path | None = None,
-    size_gb: int = 16,
-    *,
-    progress: ProgressCallback | None = None,
-) -> Path:
-    paths = PhoneClonePaths()
-    paths.ensure()
-    disk = dest or paths.android_disk
-    qemu_img_path = Path(qemu_img)
-    if not qemu_img_path.is_file():
-        raise FileNotFoundError(f"qemu-img not found: {qemu_img_path}")
-    _emit(progress, 0, f"Creating {size_gb} GB disk image…")
+def _find_disk_in_tree(root: Path) -> Path | None:
+    for ext in (".vdi", ".vmdk", ".img", ".qcow2"):
+        matches = sorted(root.rglob(f"*{ext}"))
+        if matches:
+            return max(matches, key=lambda p: p.stat().st_size)
+    return None
+
+
+def _extract_archive(archive: Path, dest: Path) -> None:
+    if dest.exists():
+        shutil.rmtree(dest, ignore_errors=True)
+    dest.mkdir(parents=True, exist_ok=True)
+    if zipfile.is_zipfile(archive):
+        with zipfile.ZipFile(archive, "r") as zf:
+            zf.extractall(dest)
+        return
+    if tarfile.is_tarfile(archive):
+        with tarfile.open(archive, "r:*") as tf:
+            tf.extractall(dest)
+        return
+    raise RuntimeError(f"Unsupported archive format: {archive.name}")
+
+
+def _convert_to_raw_disk(source: Path, dest: Path, qemu_img: Path) -> None:
     flags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+    fmt = "vdi" if source.suffix.lower() == ".vdi" else "vmdk" if source.suffix.lower() == ".vmdk" else "raw"
+    if source.suffix.lower() == ".img":
+        shutil.copy2(source, dest)
+        return
     result = subprocess.run(
-        [str(qemu_img_path), "create", "-f", "raw", str(disk), f"{size_gb}G"],
+        [str(qemu_img), "convert", "-f", fmt, "-O", "raw", str(source), str(dest)],
         capture_output=True,
         text=True,
         creationflags=flags,
     )
     if result.returncode != 0:
-        raise RuntimeError(result.stderr.strip() or "qemu-img create failed.")
-    _emit(progress, 100, f"Disk image created: {disk}")
-    return disk
+        raise RuntimeError(result.stderr.strip() or "Could not prepare Android disk.")
 
 
-def launch_android_installer(qemu_exe: str, iso_path: str, disk_path: str, log: Callable[[str], None] | None = None) -> subprocess.Popen[str]:
-    """Boot the Android-x86 installer in a visible window (one-time setup)."""
-    _log = log or (lambda _m: None)
-    cmd = [
-        qemu_exe,
-        "-name",
-        "PhoneClone-Android-Install",
-        "-machine",
-        "q35,accel=whpx:tcg",
-        "-cpu",
-        "max",
-        "-m",
-        "2048",
-        "-smp",
-        "2",
-        "-cdrom",
-        iso_path,
-        "-drive",
-        f"file={disk_path},format=raw,if=virtio",
-        "-boot",
-        "d",
-        "-device",
-        "virtio-gpu-pci",
-        "-display",
-        "sdl",
-        "-usb",
-        "-device",
-        "usb-tablet",
-    ]
-    _log("Launching Android installer: " + " ".join(cmd))
-    return subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+def download_android_runtime(progress: ProgressCallback | None = None) -> Path:
+    """Download a pre-installed Android-x86 image and prepare it for boot (no ISO step)."""
+    paths = PhoneClonePaths()
+    paths.ensure()
+    archive_path = paths.cache_dir / "android-runtime.zip"
+    extract_dir = paths.cache_dir / "android-runtime-extract"
+
+    last_error = ""
+    for url in ANDROID_RUNTIME_URLS:
+        try:
+            download_file(url, archive_path, progress=progress, label="Android")
+            break
+        except RuntimeError as exc:
+            last_error = str(exc)
+            archive_path.unlink(missing_ok=True)
+    else:
+        raise RuntimeError(last_error or "Could not download Android runtime.")
+
+    _emit(progress, 92, "Unpacking Android…")
+    _extract_archive(archive_path, extract_dir)
+    disk_source = _find_disk_in_tree(extract_dir)
+    if not disk_source:
+        raise RuntimeError("Downloaded Android package did not contain a disk image.")
+
+    qemu_img = paths.qemu_img
+    if not qemu_img.is_file():
+        raise RuntimeError("Engine must be installed before preparing Android.")
+
+    _emit(progress, 96, "Preparing Android (one-time)…")
+    if paths.android_disk.exists():
+        paths.android_disk.unlink(missing_ok=True)
+    _convert_to_raw_disk(disk_source, paths.android_disk, qemu_img)
+    _emit(progress, 100, "Android is ready to play.")
+    return paths.android_disk
+
+
+def runtime_ready() -> bool:
+    paths = PhoneClonePaths()
+    return (
+        paths.qemu_exe.is_file()
+        and paths.android_disk.is_file()
+        and paths.android_disk.stat().st_size > 256 * 1024 * 1024
+    )
 
 
 def bundled_qemu_ready() -> bool:
@@ -206,4 +298,4 @@ def bundled_qemu_ready() -> bool:
 
 def bundled_android_ready() -> bool:
     paths = PhoneClonePaths()
-    return paths.android_disk.is_file() and paths.android_disk.stat().st_size > 512 * 1024 * 1024
+    return paths.android_disk.is_file() and paths.android_disk.stat().st_size > 256 * 1024 * 1024

@@ -46,3 +46,11 @@ class PhoneClonePaths:
     @property
     def android_disk(self) -> Path:
         return self.images_dir / "android.img"
+
+    @property
+    def platform_tools_dir(self) -> Path:
+        return self.root / "platform-tools"
+
+    @property
+    def adb_exe(self) -> Path:
+        return self.platform_tools_dir / "adb.exe"

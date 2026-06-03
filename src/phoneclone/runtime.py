@@ -2,7 +2,12 @@ from __future__ import annotations
 
 from PySide6.QtCore import QObject, QThread, Signal
 
-from phoneclone.downloads import download_android_runtime, download_qemu, runtime_ready
+from phoneclone.downloads import (
+    download_android_runtime,
+    download_platform_tools,
+    download_qemu,
+    runtime_ready,
+)
 from phoneclone.paths import PhoneClonePaths
 
 
@@ -22,6 +27,11 @@ class RuntimeWorker(QThread):
                 self.progress.emit(50, "Downloading Android (ready to play)…")
                 download_android_runtime(
                     lambda pct, msg: self.progress.emit(50 + pct // 2, msg)
+                )
+            if not paths.adb_exe.is_file():
+                self.progress.emit(92, "Downloading ADB tools…")
+                download_platform_tools(
+                    lambda pct, msg: self.progress.emit(92 + pct // 10, msg)
                 )
             self.progress.emit(100, "All set!")
             self.finished_ok.emit()

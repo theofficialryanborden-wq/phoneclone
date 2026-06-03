@@ -1,9 +1,34 @@
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Callable
+
+
+def find_adb() -> str:
+    """Resolve adb.exe: bundled install, common SDK paths, then PATH."""
+    from phoneclone.paths import PhoneClonePaths
+
+    bundled = PhoneClonePaths().adb_exe
+    if bundled.is_file():
+        return str(bundled)
+
+    if sys.platform == "win32":
+        local_app = os.environ.get("LOCALAPPDATA", "")
+        candidates = [
+            Path(local_app) / "Android" / "Sdk" / "platform-tools" / "adb.exe",
+            Path(r"C:\Android\platform-tools\adb.exe"),
+            Path.home() / "scoop" / "apps" / "adb" / "current" / "adb.exe",
+        ]
+        for path in candidates:
+            if path.is_file():
+                return str(path)
+
+    found = shutil.which("adb")
+    return found or ""
 
 
 class AdbClient:
@@ -12,7 +37,7 @@ class AdbClient:
     def __init__(self, port: int = 5555, log: Callable[[str], None] | None = None) -> None:
         self.port = port
         self._log = log or (lambda _msg: None)
-        self._adb = shutil.which("adb")
+        self._adb = find_adb()
 
     @property
     def serial(self) -> str:
@@ -20,11 +45,11 @@ class AdbClient:
 
     @property
     def available(self) -> bool:
-        return self._adb is not None
+        return bool(self._adb)
 
     def connect(self) -> bool:
         if not self._adb:
-            self._log("ADB not found in PATH. Install Android platform-tools to use nav buttons.")
+            self._log("ADB not found. Run setup or install Android platform-tools.")
             return False
         result = subprocess.run(
             [self._adb, "connect", self.serial],
@@ -35,6 +60,33 @@ class AdbClient:
         output = (result.stdout + result.stderr).strip()
         self._log(output or "ADB connect issued.")
         return result.returncode == 0
+
+    def wait_for_device(self, timeout_sec: float = 45) -> bool:
+        if not self._adb:
+            return False
+        self.connect()
+        try:
+            result = subprocess.run(
+                [self._adb, "-s", self.serial, "wait-for-device"],
+                capture_output=True,
+                text=True,
+                timeout=timeout_sec,
+                creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+            return result.returncode == 0
+        except subprocess.TimeoutExpired:
+            return False
+
+    def device_state(self) -> str:
+        if not self._adb:
+            return ""
+        result = subprocess.run(
+            [self._adb, "-s", self.serial, "get-state"],
+            capture_output=True,
+            text=True,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        return (result.stdout + result.stderr).strip().lower()
 
     def shell(self, command: str) -> bool:
         if not self._adb:
@@ -94,7 +146,7 @@ class AdbClient:
 
     def push(self, local_path: str | Path, remote_path: str = "/sdcard/Download/") -> bool:
         if not self._adb:
-            self._log("ADB not found in PATH.")
+            self._log("ADB not found.")
             return False
         local = Path(local_path)
         if not local.is_file():
@@ -130,9 +182,9 @@ class AdbClient:
         self._log(output or "ADB pull failed.")
         return False
 
-    def install_apk(self, apk_path: str | Path) -> bool:
+    def install_apk(self, apk_path: str | Path) -> tuple[bool, str]:
         if not self._adb:
-            return False
+            return False, "ADB not found. Run Get Started setup or install Android platform-tools."
         result = subprocess.run(
             [self._adb, "-s", self.serial, "install", "-r", str(apk_path)],
             capture_output=True,
@@ -142,9 +194,10 @@ class AdbClient:
         output = (result.stdout + result.stderr).strip()
         if result.returncode == 0 and "Success" in output:
             self._log(f"Installed {Path(apk_path).name}")
-            return True
-        self._log(output or "ADB install failed.")
-        return False
+            return True, ""
+        message = output or "ADB install failed."
+        self._log(message)
+        return False, message
 
     def uninstall(self, package: str) -> bool:
         if not self._adb:

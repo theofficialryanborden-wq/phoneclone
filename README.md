@@ -38,9 +38,9 @@ python run.py
 - App launcher for installed apps
 - Hardware acceleration (WHPX) and GPU tuning in Settings
 
-## Optional: ADB
+## ADB
 
-Navigation buttons and app management work best when [Android platform-tools](https://developer.android.com/tools/releases/platform-tools) (`adb`) is on your PATH. Enable **USB debugging / ADB** in Android Developer options on first boot inside the emulator.
+Setup downloads **platform-tools** (`adb`) into `%USERPROFILE%\.phoneclone\platform-tools\`. APK install and navigation buttons use that copy automatically. You can also use a system-wide install on your PATH.
 
 ## Settings
 
