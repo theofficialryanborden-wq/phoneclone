@@ -17,6 +17,7 @@ class EmulatorConfig:
     display_height: int = 960
     adb_port: int = 5555
     vnc_port: int = 5900
+    qmp_port: int = 4444
     use_whp: bool = True
     extra_qemu_args: str = ""
     # GPU / performance

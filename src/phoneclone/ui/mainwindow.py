@@ -389,6 +389,9 @@ class BlueStacksWindow(QMainWindow):
         warning = ""
         if self.config.use_whp and not QemuEmulator.whpx_available():
             self.config.use_whp = False
+            self.config.enable_cpu_pm = False
+            if self.config.cpu_mode == "auto":
+                self.config.cpu_mode = "qemu64"
             self.config.save()
             self.emulator.config = self.config
             warning = (
@@ -429,7 +432,7 @@ class BlueStacksWindow(QMainWindow):
 
     def _on_display_status(self, message: str) -> None:
         lower = message.lower()
-        if "connected" in lower and "connecting" not in lower:
+        if ("connected" in lower and "connecting" not in lower) or "display connected" in lower:
             self._vnc_connected = True
             self._vnc_retry_timer.stop()
             self._set_status("Android running", "#3fb950")
@@ -502,7 +505,7 @@ class BlueStacksWindow(QMainWindow):
         self._set_status("Starting Android… (first boot may take 1–2 min)", "#58a6ff")
         self._output_timer.start(300)
         self._vnc_retry_timer.start(4000)
-        QTimer.singleShot(8000, self._connect_display)
+        QTimer.singleShot(12000, self._connect_display)
         self._adb_timer.start(25000)
 
     def _connect_display(self) -> None:
@@ -522,7 +525,7 @@ class BlueStacksWindow(QMainWindow):
         # #endregion
         if not self.emulator.is_running or self._vnc_connected:
             return
-        self.display.start(self.config.vnc_port)
+        self.display.start(self.config.qmp_port)
 
     def _restart_android(self) -> None:
         self._stop_android()

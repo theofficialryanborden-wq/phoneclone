@@ -65,6 +65,17 @@ class QemuEmulator:
             return "host"
         return "qemu64"
 
+    @staticmethod
+    def _uses_bundled_vbox_image(cfg: EmulatorConfig) -> bool:
+        from phoneclone.paths import PhoneClonePaths
+
+        if not cfg.system_image:
+            return False
+        try:
+            return Path(cfg.system_image).resolve() == PhoneClonePaths().android_disk.resolve()
+        except OSError:
+            return False
+
     def _gpu_args(self, cfg: EmulatorConfig) -> list[str]:
         if cfg.gpu_mode == "qxl":
             ram = max(cfg.video_memory_mb, 16) * 1024 * 1024
@@ -76,8 +87,64 @@ class QemuEmulator:
             ]
         return ["-device", "virtio-vga"]
 
+    def _cpu_arg_vbox(self, cfg: EmulatorConfig) -> str:
+        if cfg.cpu_mode != "auto":
+            return cfg.cpu_mode
+        return "host" if cfg.use_whp else "qemu64"
+
+    def _build_vbox_android_command(self, cfg: EmulatorConfig) -> list[str]:
+        """QEMU args for the bundled VirtualBox-derived Android-x86 image."""
+        privacy = cfg.privacy_mode
+        window_name = self.PRIVACY_WINDOW_TITLE if privacy else self.WINDOW_TITLE
+        drive_fmt = self._drive_format(cfg.system_image)
+        machine = self._machine_arg(cfg) if cfg.use_whp else "pc,accel=tcg"
+        cmd = [
+            cfg.qemu_path,
+            "-name",
+            window_name,
+            "-machine",
+            machine,
+            "-cpu",
+            self._cpu_arg_vbox(cfg),
+            "-smp",
+            str(cfg.cpu_cores),
+            "-m",
+            str(cfg.ram_mb),
+            "-drive",
+            f"file={cfg.system_image},format={drive_fmt},if=ide,index=0,media=disk,cache=writeback",
+            "-netdev",
+            f"user,id=net0,hostfwd=tcp::{cfg.adb_port}-:5555",
+            "-device",
+            "e1000,netdev=net0",
+            "-vga",
+            "vmware",
+            "-qmp",
+            f"tcp:127.0.0.1:{cfg.qmp_port},server,nowait",
+            "-usb",
+            "-device",
+            "usb-tablet",
+            "-audiodev",
+            "dsound,id=snd0",
+            "-device",
+            "intel-hda",
+            "-device",
+            "hda-duplex,audiodev=snd0",
+            "-rtc",
+            "base=localtime",
+            "-boot",
+            "order=c",
+        ]
+        if cfg.enable_cpu_pm and cfg.use_whp:
+            cmd.extend(["-overcommit", "cpu-pm=on"])
+        if cfg.extra_qemu_args.strip():
+            cmd.extend(cfg.extra_qemu_args.split())
+        return cmd
+
     def build_command(self) -> list[str]:
         cfg = self.config
+        if self._uses_bundled_vbox_image(cfg):
+            return self._build_vbox_android_command(cfg)
+
         vnc_display = max(cfg.vnc_port - 5900, 0)
         privacy = cfg.privacy_mode
         window_name = self.PRIVACY_WINDOW_TITLE if privacy else self.WINDOW_TITLE
@@ -103,6 +170,8 @@ class QemuEmulator:
             *self._gpu_args(cfg),
             "-display",
             f"vnc=127.0.0.1:{vnc_display}",
+            "-qmp",
+            f"tcp:127.0.0.1:{cfg.qmp_port},server,nowait",
             "-usb",
             "-device",
             "usb-tablet",
