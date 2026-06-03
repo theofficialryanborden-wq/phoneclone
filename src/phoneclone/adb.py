@@ -146,6 +146,22 @@ class AdbClient:
         self._log(output or "ADB install failed.")
         return False
 
+    def uninstall(self, package: str) -> bool:
+        if not self._adb:
+            return False
+        result = subprocess.run(
+            [self._adb, "-s", self.serial, "uninstall", package],
+            capture_output=True,
+            text=True,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        output = (result.stdout + result.stderr).strip()
+        if result.returncode == 0 and "Success" in output:
+            self._log(f"Uninstalled {package}")
+            return True
+        self._log(output or "ADB uninstall failed.")
+        return False
+
     def back(self) -> bool:
         return self.keyevent(4)
 
